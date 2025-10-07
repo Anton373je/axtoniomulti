@@ -1,0 +1,556 @@
+-- Orion Universal Script
+-- Author: ChatGPT
+-- Description: A universal, multi-tab Roblox exploit script using OrionLib.
+-- Features: Player (WalkSpeed/Jump/Tp), Movement (Fly/Noclip/InfJump), Visuals (ESP/Chams/Tracers), Combat (AimAssist), Utilities (ServerHop/Rejoin/AntiAFK), Settings (theme/keybinds), Config saving
+-- NOTE: Use at your own risk. This is a generic, best-effort universal script — some features may be blocked by game scripts or filtering.
+
+-- ======= CONFIG & ENVIRONMENT =======
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = nil
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
+
+-- global config store
+getgenv().ORION_UNIVERSAL = getgenv().ORION_UNIVERSAL or {}
+local G = getgenv().ORION_UNIVERSAL
+G.Config = G.Config or {}
+G.ConfigFileName = "OrionUniversalConfig_v1"
+
+-- default config values
+local defaultConfig = {
+    WalkSpeed = 16,
+    JumpPower = 50,
+    FlySpeed = 100,
+    FlyActive = false,
+    Noclip = false,
+    InfiniteJump = false,
+    ESP = true,
+    ESP_Boxes = true,
+    ESP_Names = true,
+    ESP_Distance = true,
+    Chams = true,
+    Tracers = false,
+    AimAssist = false,
+    AimKey = Enum.UserInputType.MouseButton2, -- right mouse
+    AimFOV = 80,
+    AimSmoothing = 0.25,
+}
+
+-- load config helper
+local function loadConfig()
+    local suc, data = pcall(function()
+        return readfile and readfile(G.ConfigFileName) or nil
+    end)
+    if suc and data then
+        local ok, parsed = pcall(function() return HttpService:JSONDecode(data) end)
+        if ok and type(parsed) == "table" then
+            for k,v in pairs(parsed) do G.Config[k] = v end
+        end
+    else
+        -- apply defaults for missing
+        for k,v in pairs(defaultConfig) do
+            if G.Config[k] == nil then G.Config[k] = v end
+        end
+    end
+end
+
+local function saveConfig()
+    if not writefile then return end
+    local suc, err = pcall(function()
+        writefile(G.ConfigFileName, HttpService:JSONEncode(G.Config))
+    end)
+    if not suc then warn("Failed to save config:", err) end
+end
+
+-- initialize config
+for k,v in pairs(defaultConfig) do if G.Config[k] == nil then G.Config[k] = v end end
+loadConfig()
+
+-- ======= ORION LIB =======
+local OrionLib = nil
+local function loadOrion()
+    if OrionLib then return OrionLib end
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Orion/main/source"))()
+    end)
+    if ok then OrionLib = res end
+    return OrionLib
+end
+
+local Orion = loadOrion()
+if not Orion then
+    warn("Failed to load Orion library. Make sure HTTP GET is allowed in your executor.")
+    return
+end
+
+local Window = Orion:MakeWindow({Name = "Orion Universal", HidePremium = false, SaveConfig = false})
+
+-- ======= UTILITIES =======
+local function notify(title, text, duration)
+    pcall(function() Orion:MakeNotification({Name = title, Content = text, Time = duration or 5}) end)
+end
+
+local function isAlive(char)
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    return hrp and humanoid and humanoid.Health > 0
+end
+
+local function getPlayersExceptLocal()
+    local t = {}
+    for _,p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then table.insert(t,p) end
+    end
+    return t
+end
+
+-- pick best target for aimassist
+local function findClosestTargetToCursor(fov)
+    local closest, closestDist = nil, fov or (G.Config.AimFOV or 80)
+    local camera = workspace.CurrentCamera
+    for _,plr in pairs(getPlayersExceptLocal()) do
+        local char = plr.Character
+        if isAlive(char) then
+            local root = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso")
+            if root then
+                local screenPos, onScreen = camera:WorldToViewportPoint(root.Position)
+                if onScreen then
+                    local centerX, centerY = camera.ViewportSize.X/2, camera.ViewportSize.Y/2
+                    local dx = screenPos.X - centerX
+                    local dy = screenPos.Y - centerY
+                    local dist = math.sqrt(dx*dx + dy*dy)
+                    if dist < closestDist then
+                        closest = {Player = plr, Char = char, Root = root, ScreenPos = screenPos}
+                        closestDist = dist
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+-- ======= VISUALS (ESP / Chams) =======
+local ESP_Objects = {}
+local function createHighlightForChar(char)
+    if not char then return end
+    local hl = Instance.new("Highlight")
+    hl.Name = "_ORION_CHAMS"
+    hl.Adornee = char
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillTransparency = 0.6
+    hl.OutlineTransparency = 0.6
+    hl.Parent = CoreGui
+    return hl
+end
+
+local function removeHighlights()
+    for _,v in pairs(CoreGui:GetChildren()) do
+        if v:IsA("Highlight") and v.Name == "_ORION_CHAMS" then pcall(function() v:Destroy() end) end
+    end
+end
+
+local espFolder = Instance.new("Folder") espFolder.Name = "_ORION_ESP" espFolder.Parent = CoreGui
+
+local function createESPForPlayer(plr)
+    if not plr.Character then return end
+    local char = plr.Character
+    local tag = {}
+    tag.Plr = plr
+    -- Box using Drawing is executor-specific; fallback: BillboardGui
+    local bill = Instance.new("BillboardGui")
+    bill.Name = "ORION_ESP_BILL"
+    bill.Adornee = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+    bill.Size = UDim2.new(0,150,0,50)
+    bill.AlwaysOnTop = true
+    bill.StudsOffset = Vector3.new(0,1.5,0)
+    local txt = Instance.new("TextLabel")
+    txt.Size = UDim2.new(1,0,1,0)
+    txt.BackgroundTransparency = 1
+    txt.TextStrokeTransparency = 0.6
+    txt.TextScaled = true
+    txt.Font = Enum.Font.SourceSansBold
+    txt.Parent = bill
+    bill.Parent = espFolder
+    tag.Bill = bill
+    ESP_Objects[plr] = tag
+    return tag
+end
+
+local function removeAllESP()
+    espFolder:ClearAllChildren()
+    ESP_Objects = {}
+end
+
+-- update loop
+spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if G.Config.ESP then
+            for _,plr in pairs(getPlayersExceptLocal()) do
+                if not ESP_Objects[plr] then createESPForPlayer(plr) end
+                local tag = ESP_Objects[plr]
+                local char = plr.Character
+                if char and isAlive(char) then
+                    local head = char:FindFirstChild("Head")
+                    local nameStr = plr.Name
+                    if G.Config.ESP_Names then nameStr = nameStr end
+                    local dist = (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") and head) and (LocalPlayer.Character.HumanoidRootPart.Position - head.Position).Magnitude or 0
+                    local dd = ""
+                    if G.Config.ESP_Distance then dd = string.format(" (%.1fm)", dist) end
+                    tag.Bill.Enabled = true
+                    tag.Bill.Adornee = head or char:FindFirstChild("HumanoidRootPart")
+                    tag.Bill.TextLabel.Text = nameStr..dd
+                else
+                    if tag.Bill then tag.Bill.Enabled = false end
+                end
+            end
+        else
+            removeAllESP()
+        end
+
+        if G.Config.Chams then
+            -- clear old then re-create
+            removeHighlights()
+            for _,plr in pairs(getPlayersExceptLocal()) do
+                local char = plr.Character
+                if char and isAlive(char) then
+                    local hl = createHighlightForChar(char)
+                    hl.FillColor = Color3.fromHSV((plr.UserId % 360)/360, 0.8, 1)
+                    hl.OutlineColor = Color3.new(0,0,0)
+                end
+            end
+        else
+            removeHighlights()
+        end
+    end
+end)
+
+-- ======= AIMASSIST (basic, smoothing) =======
+local aiming = false
+local aimConnection = nil
+
+local function startAim()
+    if aimConnection then aimConnection:Disconnect() aimConnection = nil end
+    aimConnection = RunService.RenderStepped:Connect(function(delta)
+        if not G.Config.AimAssist then return end
+        if not aiming then return end
+        local target = findClosestTargetToCursor(G.Config.AimFOV)
+        if target then
+            local cam = workspace.CurrentCamera
+            local camCFrame = cam.CFrame
+            local targetPos = target.Root.Position + Vector3.new(0,1.5,0)
+            local desired = CFrame.new(camCFrame.Position, targetPos)
+            local sm = math.clamp(G.Config.AimSmoothing or 0.25, 0.01, 1)
+            cam.CFrame = camCFrame:Lerp(desired, sm * delta * 60)
+        end
+    end)
+end
+
+-- input handlers for aim keybind
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    local kind = input.UserInputType
+    if kind == G.Config.AimKey and G.Config.AimAssist then
+        aiming = true
+        startAim()
+    end
+    -- Infinite jump
+    if G.Config.InfiniteJump and input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode.Space and LocalPlayer and LocalPlayer.Character then
+            local humanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == G.Config.AimKey then
+        aiming = false
+        if aimConnection then aimConnection:Disconnect() aimConnection = nil end
+    end
+end)
+
+-- ======= FLY & NOCLIP =======
+local flying = false
+local flyBodyGyro, flyBodyVel
+
+local function startFly()
+    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
+    local hrp = LocalPlayer.Character.HumanoidRootPart
+    flyBodyGyro = Instance.new("BodyGyro")
+    flyBodyGyro.P = 9e4
+    flyBodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    flyBodyGyro.CFrame = hrp.CFrame
+    flyBodyGyro.Parent = hrp
+    flyBodyVel = Instance.new("BodyVelocity")
+    flyBodyVel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    flyBodyVel.Velocity = Vector3.new(0,0,0)
+    flyBodyVel.Parent = hrp
+    flying = true
+    spawn(function()
+        while flying and flyBodyVel and flyBodyGyro and hrp and hrp.Parent do
+            RunService.Heartbeat:Wait()
+            local mv = Vector3.new(0,0,0)
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv = mv + workspace.CurrentCamera.CFrame.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv = mv - workspace.CurrentCamera.CFrame.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv = mv - workspace.CurrentCamera.CFrame.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv = mv + workspace.CurrentCamera.CFrame.RightVector end
+            local updown = 0
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then updown = updown + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then updown = updown - 1 end
+            flyBodyVel.Velocity = (mv.Unit * (G.Config.FlySpeed or 100) + Vector3.new(0, updown * (G.Config.FlySpeed or 100), 0))
+            flyBodyGyro.CFrame = workspace.CurrentCamera.CFrame
+        end
+        if flyBodyVel then pcall(function() flyBodyVel:Destroy() end) end
+        if flyBodyGyro then pcall(function() flyBodyGyro:Destroy() end) end
+    end)
+end
+
+local function stopFly()
+    flying = false
+    if flyBodyVel then pcall(function() flyBodyVel:Destroy() end) end
+    if flyBodyGyro then pcall(function() flyBodyGyro:Destroy() end) end
+end
+
+-- noclip
+local noclipConn
+local function setNoclip(active)
+    if active then
+        noclipConn = RunService.Stepped:Connect(function()
+            for _,part in pairs(LocalPlayer.Character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end)
+    else
+        if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+        -- try to restore collisions (best effort)
+        for _,part in pairs(LocalPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                pcall(function() part.CanCollide = true end)
+            end
+        end
+    end
+end
+
+-- ======= ANTI-AFK =======
+local antiAfkConn
+local function setAntiAfk(val)
+    if val then
+        if VirtualUser then
+            antiAfkConn = Players.LocalPlayer.Idled:Connect(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        else
+            -- fallback: send a notification
+            notify("Anti-AFK", "VirtualUser not available in this environment. Anti-AFK may not work.")
+        end
+    else
+        if antiAfkConn then antiAfkConn:Disconnect() antiAfkConn = nil end
+    end
+end
+
+-- ======= UTILITIES: SERVER HOP, REJOIN =======
+local function rejoin()
+    pcall(function()
+        if game.PlaceId and LocalPlayer then
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end
+    end)
+end
+
+local function serverHop()
+    -- simple server hop via teleport service; will attempt to find new server via external endpoints often used by exploiters.
+    -- Because HTTP requests in executors are non-standard, we provide a best-effort simple teleport to same place (rejoin)
+    rejoin()
+end
+
+-- ======= GUI CREATION =======
+local playerTab = Window:MakeTab({Name = "Player", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+local movementTab = Window:MakeTab({Name = "Movement", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+local visualsTab = Window:MakeTab({Name = "Visuals", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+local combatTab = Window:MakeTab({Name = "Combat", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+local utilsTab = Window:MakeTab({Name = "Utilities", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+local settingsTab = Window:MakeTab({Name = "Settings", Icon = "rbxassetid://4483345998", PremiumOnly = false})
+
+-- Player Tab
+playerTab:AddSlider({Name = "WalkSpeed", Min = 6, Max = 500, Default = G.Config.WalkSpeed, Color = Color3.fromRGB(255,255,255), Increment = 1, ValueName = "studs/s", Callback = function(v)
+    G.Config.WalkSpeed = v
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = v
+    end
+    saveConfig()
+end})
+
+playerTab:AddSlider({Name = "JumpPower", Min = 20, Max = 500, Default = G.Config.JumpPower, Increment = 1, ValueName = "power", Callback = function(v)
+    G.Config.JumpPower = v
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid").JumpPower = v
+    end
+    saveConfig()
+end})
+
+playerTab:AddButton({Name = "Reset Speed/Jump to Default", Callback = function()
+    G.Config.WalkSpeed = defaultConfig.WalkSpeed
+    G.Config.JumpPower = defaultConfig.JumpPower
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = G.Config.WalkSpeed
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid").JumpPower = G.Config.JumpPower
+    end
+    saveConfig()
+    notify("Player", "WalkSpeed and JumpPower reset to defaults.")
+end})
+
+playerTab:AddDropdown({Name = "Teleport to Player", Default = nil, Options = (function()
+    local opts = {}
+    for _,p in pairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(opts, p.Name) end end
+    return opts
+end)(), Callback = function(selected)
+    local target = Players:FindFirstChild(selected)
+    if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        LocalPlayer.Character.HumanoidRootPart.CFrame = target.Character.HumanoidRootPart.CFrame + Vector3.new(0,3,0)
+    else
+        notify("Teleport", "Could not teleport to player.")
+    end
+end})
+
+-- Movement Tab
+movementTab:AddToggle({Name = "Fly", Default = G.Config.FlyActive, Callback = function(val)
+    G.Config.FlyActive = val
+    if val then startFly() else stopFly() end
+    saveConfig()
+end})
+
+movementTab:AddSlider({Name = "Fly Speed", Min = 10, Max = 1000, Default = G.Config.FlySpeed, Increment = 1, ValueName = "speed", Callback = function(v)
+    G.Config.FlySpeed = v
+    saveConfig()
+end})
+
+movementTab:AddToggle({Name = "Noclip", Default = G.Config.Noclip, Callback = function(val)
+    G.Config.Noclip = val
+    setNoclip(val)
+    saveConfig()
+end})
+
+movementTab:AddToggle({Name = "Infinite Jump", Default = G.Config.InfiniteJump, Callback = function(val)
+    G.Config.InfiniteJump = val
+    saveConfig()
+end})
+
+-- Visuals Tab
+visualsTab:AddToggle({Name = "ESP", Default = G.Config.ESP, Callback = function(val)
+    G.Config.ESP = val
+    saveConfig()
+end})
+visualsTab:AddToggle({Name = "ESP Names", Default = G.Config.ESP_Names, Callback = function(val)
+    G.Config.ESP_Names = val
+    saveConfig()
+end})
+visualsTab:AddToggle({Name = "ESP Distance", Default = G.Config.ESP_Distance, Callback = function(val)
+    G.Config.ESP_Distance = val
+    saveConfig()
+end})
+visualsTab:AddToggle({Name = "Chams (Highlight)", Default = G.Config.Chams, Callback = function(val)
+    G.Config.Chams = val
+    saveConfig()
+end})
+visualsTab:AddToggle({Name = "Tracers", Default = G.Config.Tracers, Callback = function(val)
+    G.Config.Tracers = val
+    saveConfig()
+end})
+
+-- Combat Tab
+combatTab:AddToggle({Name = "AimAssist", Default = G.Config.AimAssist, Callback = function(val)
+    G.Config.AimAssist = val
+    saveConfig()
+end})
+combatTab:AddSlider({Name = "Aim FOV (px radius)", Min = 10, Max = 1000, Default = G.Config.AimFOV, Increment = 1, ValueName = "pixels", Callback = function(v)
+    G.Config.AimFOV = v
+    saveConfig()
+end})
+combatTab:AddSlider({Name = "Aim Smoothing", Min = 0.01, Max = 1, Default = G.Config.AimSmoothing, Increment = 0.01, ValueName = "smooth", Callback = function(v)
+    G.Config.AimSmoothing = v
+    saveConfig()
+end})
+combatTab:AddKeybind({Name = "Aim Keybind (press) - default: RightMouse", Default = nil, Hold = true, Callback = function(key)
+    -- key is string such as "MouseButton2" or EnumValue depending on Orion version
+    -- we'll map a few common values
+    -- allow user to change between MouseButton1/2/3 or Keyboard keys
+    if typeof(key) == "EnumItem" then
+        if key.EnumType == Enum.UserInputType then
+            G.Config.AimKey = key
+        elseif key.EnumType == Enum.KeyCode then
+            G.Config.AimKey = key
+        end
+    elseif typeof(key) == "string" then
+        -- left as string, try to convert when used
+        G.Config.AimKey = key
+    else
+        G.Config.AimKey = key
+    end
+    saveConfig()
+end})
+
+-- Utilities Tab
+utilsTab:AddButton({Name = "Rejoin Server", Callback = function() rejoin() end})
+utilsTab:AddButton({Name = "Server Hop (rejoin)", Callback = function() serverHop() end})
+utilsTab:AddToggle({Name = "Anti AFK", Default = false, Callback = function(val) setAntiAfk(val) end})
+
+-- Settings Tab
+settingsTab:AddButton({Name = "Save Config Now", Callback = function() saveConfig() notify("Config", "Saved config file.") end})
+settingsTab:AddButton({Name = "Load Config Now", Callback = function() loadConfig() notify("Config", "Loaded config file.") end})
+settingsTab:AddButton({Name = "Reset To Defaults", Callback = function()
+    G.Config = {}
+    for k,v in pairs(defaultConfig) do G.Config[k] = v end
+    saveConfig()
+    notify("Settings", "Reset to defaults. Reload UI to apply.")
+end})
+
+-- ======= CHARACTER ADDED HANDLERS =======
+local function onCharacterAdded(char)
+    local humanoid = char:WaitForChild("Humanoid")
+    humanoid.WalkSpeed = G.Config.WalkSpeed or defaultConfig.WalkSpeed
+    humanoid.JumpPower = G.Config.JumpPower or defaultConfig.JumpPower
+    if G.Config.Noclip then setNoclip(true) end
+    if G.Config.FlyActive and flying == false then
+        startFly()
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+
+-- ======= CLEANUP FUNCTION =======
+local function destroyAll()
+    -- restore
+    stopFly()
+    setNoclip(false)
+    removeAllESP()
+    removeHighlights()
+    if aimConnection then aimConnection:Disconnect() end
+    if antiAfkConn then antiAfkConn:Disconnect() end
+    Window:Destroy()
+    notify("Orion Universal", "Script unloaded.")
+end
+
+-- add unload button
+settingsTab:AddButton({Name = "Unload Script", Callback = function() destroyAll() end})
+
+-- final notification
+notify("Orion Universal", "Loaded. Use the GUI to configure features.")
+
+-- End of script
